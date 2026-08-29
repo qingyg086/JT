@@ -1,0 +1,51 @@
+name: Build Windows UI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: cmd
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Install Playwright Chromium
+        shell: cmd
+        run: |
+          set PLAYWRIGHT_BROWSERS_PATH=0
+          python -m playwright install chromium
+
+      - name: Build Windows app
+        shell: cmd
+        run: |
+          set PLAYWRIGHT_BROWSERS_PATH=0
+          pyinstaller --onedir --name jt-seat-monitor-ui --collect-all playwright --add-data "config.example.json;." web_ui.py
+          copy config.example.json dist\jt-seat-monitor-ui\config.json
+
+      - name: Create zip package
+        shell: powershell
+        run: |
+          Compress-Archive -Path dist\jt-seat-monitor-ui -DestinationPath jt-seat-monitor-ui-windows.zip -Force
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jt-seat-monitor-ui-windows
+          path: jt-seat-monitor-ui-windows.zip

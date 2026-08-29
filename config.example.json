@@ -1,0 +1,50 @@
+{
+  "target_url": "https://wd.jtexpress.com.cn/app/servicequalityIndex/seatStateMonitor?title=%E5%9D%90%E5%B8%AD%E5%AE%9E%E6%97%B6%E7%8A%B6%E6%80%81&resourceId=29765",
+  "interval_seconds": 60,
+  "thresholds": {
+    "online": 5,
+    "offline": 5,
+    "idle": 2
+  },
+  "notify": {
+    "feishu_webhook": "",
+    "feishu_secret": "",
+    "print_to_console": true
+  },
+  "browser": {
+    "user_data_dir": "runtime/browser-profile",
+    "headless": false,
+    "login_timeout_seconds": 180,
+    "table_row_selector": "",
+    "status_column_name": "",
+    "call_column_name": "通话"
+  },
+  "data_source": {
+    "mode": "browser_dom",
+    "api": {
+      "url": "POST {GATEWAY.SER}/seatedStateRecord/page",
+      "method": "GET",
+      "headers": {},
+      "body": null,
+      "items_path": "data.list",
+      "total_path": "data.total",
+      "pagination": {
+        "enabled": false,
+        "page_param": "page",
+        "page_size_param": "pageSize",
+        "page_size": 200,
+        "start_page": 1,
+        "max_pages": 20
+      },
+      "fields": {
+        "status": "status",
+        "call": "callStatus"
+      },
+      "values": {
+        "online": ["在线"],
+        "offline": ["离线"],
+        "idle": ["空闲"]
+      }
+    }
+  }
+}
