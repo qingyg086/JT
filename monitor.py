@@ -31,6 +31,7 @@ class Counts:
     online: int
     offline: int
     idle: int
+    offline_lines: List[str]
 
 
 class Notifier:
@@ -109,7 +110,8 @@ class AlertState:
                 self.notifier.send(
                     "离线人数异常",
                     f"当前已有 {counts.offline} 人离线，阈值为 {offline_threshold} 人。"
-                    f"\n总人数 {counts.total}，在线 {counts.online}，通话空闲 {counts.idle}。",
+                    f"\n总人数 {counts.total}，在线 {counts.online}，通话空闲 {counts.idle}。"
+                    f"\n离线分机号：{format_lines(counts.offline_lines)}",
                 )
                 self.last_offline_notified = counts.offline
             self.offline_abnormal = True
@@ -170,6 +172,27 @@ def setup_logger(base_dir: Path) -> logging.Logger:
     return logger
 
 
+def format_lines(lines: List[str], limit: int = 30) -> str:
+    if not lines:
+        return "无"
+    shown = lines[:limit]
+    text = "、".join(shown)
+    if len(lines) > limit:
+        text += f" 等 {len(lines) - limit} 个"
+    return text
+
+
+def build_query_message(counts: Counts) -> str:
+    # 手动查询消息固定包含分机号，方便一次查询对应一次运维记录。
+    return (
+        f"总人数：{counts.total}"
+        f"\n在线人数：{counts.online}"
+        f"\n离线人数：{counts.offline}"
+        f"\n通话空闲：{counts.idle}"
+        f"\n离线分机号：{format_lines(counts.offline_lines)}"
+    )
+
+
 def page_has_login_text(page) -> bool:
     try:
         body = page.locator("body").inner_text(timeout=3000)
@@ -178,15 +201,46 @@ def page_has_login_text(page) -> bool:
     return any(text in body for text in LOGIN_TEXT) and "坐席实时状态" not in body
 
 
-def wait_until_logged_in(page, timeout_seconds: int, logger: logging.Logger) -> None:
+def wait_until_logged_in(
+    page,
+    timeout_seconds: int,
+    logger: logging.Logger,
+    target_url: Optional[str] = None,
+    revisit_interval: int = 5,
+) -> None:
     deadline = time.time() + timeout_seconds
+    last_revisit = 0.0
+    seen_login_page = False
     while time.time() < deadline:
-        if not page_has_login_text(page):
+        if page.is_closed():
+            raise RuntimeError("登录已取消：浏览器窗口已关闭。")
+
+        is_login_page = page_has_login_text(page)
+        if is_login_page:
+            seen_login_page = True
+
+        if not is_login_page:
             try:
                 page.wait_for_selector(TABLE_ROW_SELECTOR, timeout=5000)
                 return
             except PlaywrightTimeoutError:
                 pass
+
+        if (
+            target_url
+            and seen_login_page
+            and (not is_login_page)
+            and time.time() - last_revisit >= revisit_interval
+        ):
+            last_revisit = time.time()
+            try:
+                # 见过扫码页且扫码页消失后，才主动回坐席页，避免刚加载时误刷新二维码页。
+                if not page.is_closed() and page.url != target_url:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                if page.is_closed():
+                    raise RuntimeError("登录已取消：浏览器窗口已关闭。")
+
         logger.info("等待扫码登录或页面加载...")
         time.sleep(3)
     raise RuntimeError("等待登录超时。请确认已扫码登录，并能看到坐席实时状态表格。")
@@ -301,7 +355,18 @@ def count_rows(rows: List[Dict[str, str]]) -> Counts:
     online = sum(1 for row in rows if row.get("onlineType") == "在线")
     offline = sum(1 for row in rows if row.get("onlineType") == "离线")
     idle = sum(1 for row in rows if row.get("callType") == "空闲")
-    return Counts(total=len(rows), online=online, offline=offline, idle=idle)
+    offline_lines = [
+        row.get("line", "")
+        for row in rows
+        if row.get("onlineType") == "离线" and row.get("line")
+    ]
+    return Counts(
+        total=len(rows),
+        online=online,
+        offline=offline,
+        idle=idle,
+        offline_lines=offline_lines,
+    )
 
 
 def run_monitor(config_path: Path) -> None:
@@ -326,7 +391,12 @@ def run_monitor(config_path: Path) -> None:
         )
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-        wait_until_logged_in(page, int(browser_config.get("login_timeout_seconds", 180)), logger)
+        wait_until_logged_in(
+            page,
+            int(browser_config.get("login_timeout_seconds", 180)),
+            logger,
+            target_url,
+        )
 
         try:
             while True:
@@ -370,7 +440,12 @@ def run_discovery(config_path: Path) -> None:
         )
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-        wait_until_logged_in(page, int(browser_config.get("login_timeout_seconds", 180)), logger)
+        wait_until_logged_in(
+            page,
+            int(browser_config.get("login_timeout_seconds", 180)),
+            logger,
+            target_url,
+        )
         rows = collect_all_rows(page, logger)
         counts = count_rows(rows)
 

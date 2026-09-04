@@ -14,6 +14,7 @@ from monitor import (
     Counts,
     Notifier,
     TABLE_ROW_SELECTOR,
+    build_query_message,
     collect_all_rows,
     count_rows,
     load_config,
@@ -60,6 +61,8 @@ class MonitorWorker(threading.Thread):
             command = self.commands.get()
             if command == "login":
                 self._login()
+            elif command == "query":
+                self._query_once()
             elif command == "start":
                 self._monitor()
             elif command == "shutdown":
@@ -150,16 +153,48 @@ class MonitorWorker(threading.Thread):
             config = load_config(self.config_path)
             self._ensure_browser(config)
             timeout = int(config.get("browser", {}).get("login_timeout_seconds", 180))
-            wait_until_logged_in(self.page, timeout, self.logger)
+            self._status("正在确认登录状态")
+            wait_until_logged_in(self.page, timeout, self.logger, config["target_url"])
+            self._status("已登录，正在查询")
             rows = collect_all_rows(self.page, self.logger)
             counts = count_rows(rows)
+            notifier = WebNotifier(config, self.logger, self.events)
             self._counts(counts)
+            notifier.send("坐席状态查询结果", build_query_message(counts))
             self.login_notice_sent = False
-            self._status("登录正常")
-            self._log("登录成功，已读取坐席状态")
+            self._status("查询完成")
+            self._log("登录成功，已读取坐席状态并推送查询结果")
         except Exception as exc:
-            self._status("登录失败")
+            if "登录已取消" in str(exc):
+                self._reset_browser()
+                self._status("登录已取消")
+            else:
+                self._status("登录失败")
             self._error(f"登录或读取失败：{exc}")
+
+    def _query_once(self) -> None:
+        try:
+            config = load_config(self.config_path)
+            self._ensure_browser(config)
+            timeout = int(config.get("browser", {}).get("login_timeout_seconds", 180))
+            self._status("正在确认登录状态")
+            wait_until_logged_in(self.page, timeout, self.logger, config["target_url"])
+            self._status("已登录，正在查询")
+            rows = collect_all_rows(self.page, self.logger)
+            counts = count_rows(rows)
+            notifier = WebNotifier(config, self.logger, self.events)
+            self._counts(counts)
+            notifier.send("坐席状态查询结果", build_query_message(counts))
+            self.login_notice_sent = False
+            self._status("查询完成")
+            self._log("手动查询完成，已推送查询结果")
+        except Exception as exc:
+            if "登录已取消" in str(exc):
+                self._reset_browser()
+                self._status("登录已取消")
+            else:
+                self._status("查询失败")
+            self._error(f"手动查询失败：{exc}")
 
     def _is_login_problem(self, exc: Exception) -> bool:
         text = str(exc)
@@ -209,6 +244,9 @@ class MonitorWorker(threading.Thread):
             if command == "start":
                 self._log("监控已暂停，等待重新登录")
                 continue
+            if command == "query":
+                self._log("监控已暂停，需要重新登录后才能手动查询")
+                continue
             if command != "login":
                 if command is not None:
                     continue
@@ -216,7 +254,15 @@ class MonitorWorker(threading.Thread):
                     continue
                 last_auto_check = time.time()
                 try:
-                    if self.page and not self.page.is_closed() and not page_has_login_text(self.page):
+                    if self.page and not self.page.is_closed():
+                        if self.page.url != config["target_url"]:
+                            self.page.goto(
+                                config["target_url"],
+                                wait_until="domcontentloaded",
+                                timeout=60000,
+                            )
+                        if page_has_login_text(self.page):
+                            continue
                         self.page.wait_for_selector(TABLE_ROW_SELECTOR, timeout=3000)
                         rows = collect_all_rows(self.page, self.logger)
                         counts = count_rows(rows)
@@ -233,7 +279,7 @@ class MonitorWorker(threading.Thread):
                 self._ensure_browser(config)
                 self.page.goto(config["target_url"], wait_until="domcontentloaded", timeout=60000)
                 self._status("等待扫码")
-                wait_until_logged_in(self.page, timeout, self.logger)
+                wait_until_logged_in(self.page, timeout, self.logger, config["target_url"])
                 rows = collect_all_rows(self.page, self.logger)
                 counts = count_rows(rows)
                 self._counts(counts)
@@ -250,7 +296,7 @@ class MonitorWorker(threading.Thread):
             config = load_config(self.config_path)
             self._ensure_browser(config)
             timeout = int(config.get("browser", {}).get("login_timeout_seconds", 180))
-            wait_until_logged_in(self.page, timeout, self.logger)
+            wait_until_logged_in(self.page, timeout, self.logger, config["target_url"])
             interval = int(config.get("interval_seconds", 60))
             notifier = WebNotifier(config, self.logger, self.events)
             state = AlertState(config.get("thresholds", {}), notifier)
@@ -279,17 +325,11 @@ class MonitorWorker(threading.Thread):
                 except Exception as exc:
                     if self._is_browser_closed_problem(exc):
                         self._status("浏览器已关闭")
-                        self._log("极兔浏览器窗口已关闭，监控暂停并准备重新打开登录窗口")
-                        try:
-                            self._ensure_browser(config)
-                            wait_until_logged_in(self.page, timeout, self.logger)
-                        except Exception as login_exc:
-                            if self._is_login_problem(login_exc):
-                                if not self._wait_for_relogin(config, notifier):
-                                    self._log("监控已停止")
-                                    return
-                                continue
-                            self._error(f"重新打开登录窗口失败：{login_exc}")
+                        self._log("极兔浏览器窗口已关闭，监控暂停，请在 UI 点击“登录极兔系统”后重新登录")
+                        self._reset_browser()
+                        if not self._wait_for_relogin(config, notifier):
+                            self._log("监控已停止")
+                            return
                         continue
                     if self._is_login_problem(exc):
                         if not self._wait_for_relogin(config, notifier):
@@ -325,6 +365,8 @@ class MonitorWorker(threading.Thread):
                     return True
                 if command == "login":
                     self._log("浏览器已经打开")
+                if command == "query":
+                    self._query_once()
                 if command == "start":
                     self._log("监控已经在运行")
         except queue.Empty:
@@ -404,6 +446,7 @@ def html() -> str:
     <div class="buttons">
       <button class="secondary" onclick="saveConfig()">保存配置</button>
       <button onclick="sendCommand('login')">登录极兔系统</button>
+      <button onclick="sendCommand('query')">查询并推送</button>
       <button onclick="sendCommand('start')">开始监控</button>
       <button class="danger" onclick="sendCommand('stop')">停止监控</button>
     </div>
@@ -527,7 +570,7 @@ class Handler(BaseHTTPRequestHandler):
                 config["interval_seconds"] = int(patch["interval_seconds"])
             CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
             self._json({"ok": True})
-        elif self.path in ("/api/login", "/api/start", "/api/stop"):
+        elif self.path in ("/api/login", "/api/query", "/api/start", "/api/stop"):
             ensure_worker().command(self.path.rsplit("/", 1)[-1])
             self._json({"ok": True})
         else:
